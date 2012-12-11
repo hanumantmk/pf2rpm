@@ -14,6 +14,30 @@ to:
 It's not a terribly long or complicated piece of software, but it does save on
 boilerplate
 
+Usage
+-----
+
+    ./pf2rpm - APPLICATION APPLICATION_PARAMS [OPTIONS]
+    
+    Applications
+        search TERM   search for a package
+    
+        create PKG    create rpms for the given package and it's dependencies.
+                      This always downloads all necessary tarballs and builds spec
+                      files.  By default no rpms or srpms are produced
+    
+            --repo    the repository to work in
+            --srpm    build srpms
+            --rpm     build rpms
+    
+    Options
+        --forge       url serving the puppet forge api
+        --help        this help notice
+    
+    Debugging
+        --verbose     High level messages
+        --debug       Low level messages
+
 Details
 -------
 
