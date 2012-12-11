@@ -1,0 +1,265 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Getopt::Long;
+use List::Util qw( max first );
+use Archive::Tar;
+use LWP;
+use URI;
+use JSON;
+use File::Basename;
+use File::Path qw( make_path );
+use Template;
+use version;
+
+use constant SEARCH_URI => "/modules.json";
+use constant DEP_INFO_URI => "/api/v1/releases.json";
+
+use constant APPLICATIONS => {
+    'search' => \&search,
+    'create' => \&create,
+};
+
+my $cache;
+
+my $forge = "http://forge.puppetlabs.com";
+GetOptions(
+    'forge=s' => \$forge,
+    'cache=s' => \$cache,
+    'help' => sub { &HELP(0) },
+) or HELP(1);
+
+my $application = shift @ARGV;
+
+$application ||= '';
+
+if (APPLICATIONS->{$application}) {
+    APPLICATIONS->{$application}->(@ARGV);
+} else {
+    print "invalid application '$application'\n";
+    HELP(1);
+}
+
+sub search {
+    my ($term) = @_;
+    my $ua = make_ua();
+
+    my @data = map {
+        [$_->{full_name}, $_->{desc}]
+    } @{from_json(make_req($ua, $forge . SEARCH_URI, ["q", $term]))};
+
+    render_table(\@data);
+}
+
+sub create {
+    my ($author, $module, $version) = @_;
+
+    $cache or print "Please enter a cache\n" and HELP(1);
+    make_path(
+	$cache,
+	"$cache/SOURCES",
+	"$cache/SPECS",
+    );
+
+    my $ua = make_ua();
+
+    my $output = get_dependency_info($ua, $author, $module, $version);
+
+    foreach my $pkg (keys %$output) {
+	my $info = $output->{$pkg};
+
+	ensure_tarball($ua, $info);
+	write_specfile($info);
+    }
+}
+
+sub ensure_tarball {
+    my ($ua, $info) = @_;
+
+    my $fname = "$cache/SOURCES/$info->{file}";
+
+    if (! -e $fname) {
+	my $data = make_req($ua, "$forge/$info->{url}");
+
+	open FILE, '>', $fname or die "Couldn't open file $fname: $!";
+
+	print FILE $data;
+
+	close FILE or die "Couldn't close file $fname: $!";
+    }
+}
+
+sub get_dependency_info {
+    my ($ua, $author, $module, $version) = @_;
+
+    my $deps = from_json(
+        make_req($ua, $forge . DEP_INFO_URI, [
+            'module', "$author/${module}",
+            ( $version ? ("version", $version) : ()),
+        ])
+    );
+
+    my %output = map {
+        my $pkg = $_;
+
+        my ($latest) = map { $_->[1] } sort {
+            $b->[0] <=> $a->[0]
+        } map {
+            [ parse_version($_->{version}), $_ ];
+        } @{$deps->{$pkg}};
+
+        $pkg, {
+            version      => $latest->{version},
+            url          => "$pkg/$latest->{version}.tar.gz",
+            file         => "puppetforge-" . basename($latest->{file}),
+            dependencies => $latest->{dependencies},
+        };
+    } keys %$deps;
+
+    return \%output;
+}
+
+sub parse_version {
+    my $vstr = shift;
+
+    $vstr =~ s/[a-zA-Z]//g;
+    $vstr =~ s/-/./g;
+
+    version->parse($vstr);
+}
+
+sub make_ua {
+    my $ua = LWP::UserAgent->new;
+    $ua->agent("pf2rpm/0.1 ");
+
+    return $ua;
+}
+
+sub make_req {
+    my ($ua, $uri, $values) = @_;
+
+    my $url = URI->new($uri);
+    $url->query_form(@$values);
+
+    my $response = $ua->get($url);
+
+    if ($response->is_success) {
+        return $response->content;
+    } else {
+        die "Request failed for $url: " . $response->status_line;
+    }
+}
+
+sub render_table {
+    my ($data) = @_;
+
+    my @max_widths;
+
+    foreach my $row (@$data) {
+        for (my $i = 0; $i < @$row; $i++) {
+            $max_widths[$i] ||= 0;
+            $max_widths[$i] = max($max_widths[$i], length($row->[$i]));
+        }
+    }
+
+    my $fmt = join(' ', map {
+        "%-${_}s"
+    } @max_widths) . "\n";
+
+    printf($fmt, @$_) for @$data;
+}
+
+sub write_specfile {
+    my $info = shift;
+
+    my $tar = Archive::Tar->new();
+
+    $tar->read("$cache/SOURCES/$info->{file}");
+
+    my $metadata_file = first { 
+	$_->name =~ /metadata\.json$/
+    } $tar->get_files;
+
+    if (! $metadata_file) {
+	die "no metadata.json for $info->{file}";
+    }
+
+    my $m = from_json($metadata_file->get_content);
+
+    my @deps = map {
+	my $pkg = $_->{name};
+	$pkg =~ s/\//-/g;
+
+	"puppetforge-$pkg $_->{version_requirement}";
+    } @{$m->{dependencies}};
+
+    my $module = $m->{name};
+    $module =~ s/^$m->{author}-//;
+
+    my $vars = {
+	dependencies => \@deps,
+	description  => $m->{description},
+	files        => [keys %{$m->{checksums}}],
+	license      => $m->{license},
+	module       => $module,
+	name         => "puppetforge-$m->{name}",
+	summary      => $m->{summary},
+	version      => $m->{version},
+    };
+
+    my $tt = Template->new();
+
+    my $template = SPEC_TEMPLATE();
+
+    $tt->process(\$template, $vars, "$cache/SPECS/$m->{name}.spec");
+}
+
+sub HELP {
+    my $exit = shift;
+
+    print <<HELP ;
+$0 - APPLICATION [OPTIONS]
+
+Applications
+    search      search for a package
+    create      create rpms
+
+Options
+    --help      this help notice
+HELP
+
+    exit $exit;
+}
+
+use constant SPEC_TEMPLATE => <<'SPEC' ;
+%define name [% name %]
+%define release   1
+%define version   [% version %]
+
+Summary: [% summary %]
+License: [% license %]
+Name:%{name}
+Version:%{version}
+Release:%{release}
+Source:%{name}-%{version}.tar.gz
+Prefix:/
+
+[% FOREACH dep IN dependencies.sort %]
+Requires: [% dep %] [% END %]
+
+%prep
+%setup -q
+
+%install
+mkdir -p %{_datarootdir}/[% module %]
+cp -r * %{_datarootdir}/[% module %]
+
+%files
+[% FOREACH file IN files.sort %]
+%{_datarootdir}/[% module %]/[% file %][% END %]
+
+%description
+[% description %]
+
+SPEC
