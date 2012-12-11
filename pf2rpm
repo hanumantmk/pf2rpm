@@ -21,13 +21,18 @@ use constant APPLICATIONS => {
     'create' => \&create,
 };
 
-my $cache;
+my $verbose;
+my $debug;
 
+my $repo;
 my $forge = "http://forge.puppetlabs.com";
+
 GetOptions(
     'forge=s' => \$forge,
-    'cache=s' => \$cache,
-    'help' => sub { &HELP(0) },
+    'repo=s'  => \$repo,
+    'verbose' => \$verbose,
+    'debug'   => \$debug,
+    'help'    => sub { &HELP(0) },
 ) or HELP(1);
 
 my $application = shift @ARGV;
@@ -45,6 +50,8 @@ sub search {
     my ($term) = @_;
     my $ua = make_ua();
 
+    verbose("Searching for $term...");
+
     my @data = map {
         [$_->{full_name}, $_->{desc}]
     } @{from_json(make_req($ua, $forge . SEARCH_URI, ["q", $term]))};
@@ -53,18 +60,21 @@ sub search {
 }
 
 sub create {
-    my ($author, $module, $version) = @_;
+    my ($package, $version) = @_;
 
-    $cache or print "Please enter a cache\n" and HELP(1);
+    $repo or print "Please enter a repo\n" and HELP(1);
+
+    verbose("Ensuring paths for $repo");
+
     make_path(
-	$cache,
-	"$cache/SOURCES",
-	"$cache/SPECS",
+	$repo,
+	"$repo/SOURCES",
+	"$repo/SPECS",
     );
 
     my $ua = make_ua();
 
-    my $output = get_dependency_info($ua, $author, $module, $version);
+    my $output = get_dependency_info($ua, $package, $version);
 
     foreach my $pkg (keys %$output) {
 	my $info = $output->{$pkg};
@@ -77,9 +87,13 @@ sub create {
 sub ensure_tarball {
     my ($ua, $info) = @_;
 
-    my $fname = "$cache/SOURCES/$info->{file}";
+    verbose("Ensuring tarball for $info->{file}");
+
+    my $fname = "$repo/SOURCES/$info->{file}";
 
     if (! -e $fname) {
+        verbose("Fetching tarball for $info->{file}");
+
 	my $data = make_req($ua, "$forge/$info->{url}");
 
 	open FILE, '>', $fname or die "Couldn't open file $fname: $!";
@@ -91,11 +105,13 @@ sub ensure_tarball {
 }
 
 sub get_dependency_info {
-    my ($ua, $author, $module, $version) = @_;
+    my ($ua, $package, $version) = @_;
+
+    verbose("Gathering dependency info for $package...");
 
     my $deps = from_json(
         make_req($ua, $forge . DEP_INFO_URI, [
-            'module', "$author/${module}",
+            'module', "$package",
             ( $version ? ("version", $version) : ()),
         ])
     );
@@ -109,8 +125,11 @@ sub get_dependency_info {
             [ parse_version($_->{version}), $_ ];
         } @{$deps->{$pkg}};
 
+        my ($version, $release) = split /-/, $latest->{version};
+
         $pkg, {
-            version      => $latest->{version},
+            version      => $version,
+            release      => $release,
             url          => "$pkg/$latest->{version}.tar.gz",
             file         => "puppetforge-" . basename($latest->{file}),
             dependencies => $latest->{dependencies},
@@ -142,9 +161,14 @@ sub make_req {
     my $url = URI->new($uri);
     $url->query_form(@$values);
 
+    verbose("Requesting $url...");
+
     my $response = $ua->get($url);
 
     if ($response->is_success) {
+        verbose("Succesfully retrieved content for $url");
+        debug("Content = [" . $response->content . "]");
+
         return $response->content;
     } else {
         die "Request failed for $url: " . $response->status_line;
@@ -173,9 +197,9 @@ sub render_table {
 sub write_specfile {
     my $info = shift;
 
-    my $tar = Archive::Tar->new();
+    my $tar = Archive::Tar->new("$repo/SOURCES/$info->{file}");
 
-    $tar->read("$cache/SOURCES/$info->{file}");
+    $tar or die "Couldn't open $info->{file}";
 
     my $metadata_file = first { 
 	$_->name =~ /metadata\.json$/
@@ -197,23 +221,39 @@ sub write_specfile {
     my $module = $m->{name};
     $module =~ s/^$m->{author}-//;
 
+    my $builddir = join("-",
+        $m->{name},
+        $info->{version},
+        ($info->{release} ? $info->{release} : ()),
+    );
+
     my $vars = {
 	dependencies => \@deps,
 	description  => $m->{description},
-	files        => [keys %{$m->{checksums}}],
+	files        => ["metadata.json", keys %{$m->{checksums}}],
 	license      => $m->{license},
 	module       => $module,
 	name         => "puppetforge-$m->{name}",
 	summary      => $m->{summary},
-	version      => $m->{version},
+	version      => $info->{version},
+        release      => $info->{release} || 1,
+        source       => $info->{file},
+        builddir     => $builddir,
     };
 
     my $tt = Template->new();
 
     my $template = SPEC_TEMPLATE();
 
-    $tt->process(\$template, $vars, "$cache/SPECS/$m->{name}.spec");
+    my $spec_name = "$repo/SPECS/puppetforge-$m->{name}.spec";
+
+    verbose("Writing $spec_name");
+
+    $tt->process(\$template, $vars, $spec_name);
 }
+
+sub verbose { print "@_\n" if $verbose || $debug }
+sub debug { print "@_\n" if $debug }
 
 sub HELP {
     my $exit = shift;
@@ -226,7 +266,13 @@ Applications
     create      create rpms
 
 Options
+    --repo      the repository to work in
+    --forge     url serving the puppet forge api
     --help      this help notice
+
+Debugging
+    --verbose   High level messages
+    --debug     Low level messages
 HELP
 
     exit $exit;
@@ -234,7 +280,7 @@ HELP
 
 use constant SPEC_TEMPLATE => <<'SPEC' ;
 %define name [% name %]
-%define release   1
+%define release   [% release %]
 %define version   [% version %]
 
 Summary: [% summary %]
@@ -242,22 +288,21 @@ License: [% license %]
 Name:%{name}
 Version:%{version}
 Release:%{release}
-Source:%{name}-%{version}.tar.gz
-Prefix:/
+Source: [% source %]
 
 [% FOREACH dep IN dependencies.sort %]
 Requires: [% dep %] [% END %]
 
 %prep
-%setup -q
+%setup -q -n [% builddir %]
 
 %install
-mkdir -p %{_datarootdir}/[% module %]
-cp -r * %{_datarootdir}/[% module %]
+mkdir -p %{buildroot}%{_datarootdir}/puppet/modules/[% module %]
+cp -r * %{buildroot}%{_datarootdir}/puppet/modules/[% module %]
 
 %files
 [% FOREACH file IN files.sort %]
-%{_datarootdir}/[% module %]/[% file %][% END %]
+%{_datarootdir}/puppet/modules/[% module %]/[% file %][% END %]
 
 %description
 [% description %]
